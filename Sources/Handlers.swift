@@ -96,6 +96,9 @@ func handleChatCompletion(_ request: Request, context: some RequestContext) asyn
         )
     }
 
+    // Validation passed, so the id resolves; the fallback is unreachable.
+    let servedModel = ServedModel.resolve(chatRequest.model) ?? .default
+    let model = servedModel.rawValue
     events.append("decoded messages=\(chatRequest.messages.count) stream=\(isStreaming) model=\(chatRequest.model)")
     // Stop sequences (#483): already validated above, so decoding succeeds.
     let stopSequences = (try? StopSequences.decode(chatRequest.stop).get()) ?? []
@@ -154,11 +157,13 @@ func handleChatCompletion(_ request: Request, context: some RequestContext) asyn
         permissive: serverState.config.permissive,
         contextConfig: contextConfig,
         retryEnabled: serverState.config.retryEnabled,
-        retryCount: serverState.config.retryCount
+        retryCount: serverState.config.retryCount,
+        useCase: servedModel.useCase
     )
 
-    // Inject MCP tools if client didn't send any; track source for auto-execution
-    let mcpTools = await serverState.mcpManager?.allTools()
+    // Inject MCP tools if client didn't send any; track source for auto-execution.
+    // A model without tool calling (content tagging, fork #1) never gets them.
+    let mcpTools = servedModel.supportsTools ? await serverState.mcpManager?.allTools() : nil
     let resolvedTools = ToolResolution.resolve(clientTools: chatRequest.tools, mcpTools: mcpTools)
 
     // Resolve the enforceable tool contract against the FULL scope (client
@@ -275,7 +280,7 @@ func handleChatCompletion(_ request: Request, context: some RequestContext) asyn
         let result = try await mcpAutoExecuteResponse(
             session: session, prompt: finalUserPrompt, userPrompt: userPrompt,
             originalMessages: chatRequest.messages, sessionOptions: sessionOpts,
-            id: requestId, created: created, genOpts: genOpts,
+            id: requestId, created: created, model: model, genOpts: genOpts,
             promptTokens: promptTokens, streaming: isStreaming,
             includeUsage: includeUsage, jsonMode: jsonMode, policy: toolPolicy,
             requestBody: requestBodyString, events: events
@@ -289,7 +294,7 @@ func handleChatCompletion(_ request: Request, context: some RequestContext) asyn
             let result = structuredStreamingResponse(
                 session: session, prompt: finalUserPrompt, schema: schema,
                 renderer: structuredRenderer,
-                id: requestId, created: created, genOpts: genOpts,
+                id: requestId, created: created, model: model, genOpts: genOpts,
                 promptTokens: promptTokens, includeUsage: includeUsage,
                 requestBody: requestBodyString, events: events)
             return (result.response, result.trace)
@@ -297,14 +302,14 @@ func handleChatCompletion(_ request: Request, context: some RequestContext) asyn
         let result = try await structuredNonStreamingResponse(
             session: session, prompt: finalUserPrompt, schema: schema,
             renderer: structuredRenderer,
-            id: requestId, created: created, genOpts: genOpts,
+            id: requestId, created: created, model: model, genOpts: genOpts,
             promptTokens: promptTokens, requestBody: requestBodyString, events: events)
         return (result.response, result.trace)
     }
 
     if isStreaming {
         let result = streamingResponse(session: session, prompt: finalUserPrompt,
-                                       id: requestId, created: created,
+                                       id: requestId, created: created, model: model,
                                        genOpts: genOpts, promptTokens: promptTokens,
                                        includeUsage: includeUsage, jsonMode: jsonMode,
                                        policy: toolPolicy, stopSequences: stopSequences,
@@ -312,7 +317,7 @@ func handleChatCompletion(_ request: Request, context: some RequestContext) asyn
         return (result.response, result.trace)
     } else {
         let result = try await nonStreamingResponse(session: session, prompt: finalUserPrompt,
-                                                     id: requestId, created: created,
+                                                     id: requestId, created: created, model: model,
                                                      genOpts: genOpts, promptTokens: promptTokens,
                                                      jsonMode: jsonMode, policy: toolPolicy,
                                                      stopSequences: stopSequences,
@@ -333,6 +338,7 @@ private func mcpAutoExecuteResponse(
     sessionOptions: SessionOptions,
     id: String,
     created: Int,
+    model: String,
     genOpts: GenerationOptions,
     promptTokens: PromptTokens,
     streaming: Bool,
@@ -380,7 +386,7 @@ private func mcpAutoExecuteResponse(
         if case .refusal(let explanation) = classified {
             if streaming {
                 return await refusalStreamingResponse(
-                    id: id, created: created, promptTokens: await promptTokens.resolve(),
+                    id: id, created: created, model: model, promptTokens: await promptTokens.resolve(),
                     completedRounds: usageRounds,
                     refusal: explanation, includeUsage: includeUsage,
                     requestBody: requestBody,
@@ -388,7 +394,7 @@ private func mcpAutoExecuteResponse(
                 )
             }
             return await refusalNonStreamingResponse(
-                id: id, created: created, promptTokens: await promptTokens.resolve(),
+                id: id, created: created, model: model, promptTokens: await promptTokens.resolve(),
                 completedRounds: usageRounds,
                 refusal: explanation, requestBody: requestBody,
                 events: events + ["refusal: \(classified.cliLabel)"]
@@ -481,17 +487,17 @@ private func mcpAutoExecuteResponse(
     if streaming {
         // SSE event order: role -> content -> stop [-> usage when opted in] -> [DONE]
         var chunks: [String] = [
-            sseDataLine(sseRoleChunk(id: id, created: created, includeUsage: includeUsage)),
-            sseDataLine(sseContentChunk(id: id, created: created, content: deliveredContent, includeUsage: includeUsage)),
+            sseDataLine(sseRoleChunk(id: id, created: created, model: model, includeUsage: includeUsage)),
+            sseDataLine(sseContentChunk(id: id, created: created, model: model, content: deliveredContent, includeUsage: includeUsage)),
             sseDataLine(ChatCompletionChunk(
-                id: id, object: "chat.completion.chunk", created: created, model: modelName,
+                id: id, object: "chat.completion.chunk", created: created, model: model,
                 choices: [.init(index: 0, delta: .init(role: nil, content: nil, tool_calls: nil), finish_reason: finishReason, logprobs: nil)],
                 usage: nil,
                 includeUsageNull: includeUsage
             )),
         ]
         if includeUsage {
-            chunks.append(sseDataLine(sseUsageChunk(id: id, created: created, promptTokens: usage.promptTokens, completionTokens: usage.completionTokens)))
+            chunks.append(sseDataLine(sseUsageChunk(id: id, created: created, model: model, promptTokens: usage.promptTokens, completionTokens: usage.completionTokens)))
         }
         chunks.append(sseDone)
         let body = chunks.joined()
@@ -515,7 +521,7 @@ private func mcpAutoExecuteResponse(
             id: id,
             object: "chat.completion",
             created: created,
-            model: modelName,
+            model: model,
             choices: [.init(index: 0, message: responseMessage, finish_reason: finishReason, logprobs: nil)],
             usage: .init(prompt_tokens: usage.promptTokens, completion_tokens: usage.completionTokens,
                          total_tokens: usage.totalTokens)
@@ -543,6 +549,7 @@ private func nonStreamingResponse(
     prompt: Prompt,
     id: String,
     created: Int,
+    model: String,
     genOpts: GenerationOptions,
     promptTokens: PromptTokens,
     jsonMode: Bool,
@@ -596,7 +603,7 @@ private func nonStreamingResponse(
         let classified = classifyModelError(error)
         if case .refusal(let explanation) = classified {
             return await refusalNonStreamingResponse(
-                id: id, created: created, promptTokens: await promptTokens.resolve() + promptAdjustment,
+                id: id, created: created, model: model, promptTokens: await promptTokens.resolve() + promptAdjustment,
                 completedRounds: usageRounds,
                 refusal: explanation, requestBody: requestBody,
                 events: events + ["refusal: \(classified.cliLabel)"]
@@ -659,7 +666,7 @@ private func nonStreamingResponse(
         id: id,
         object: "chat.completion",
         created: created,
-        model: modelName,
+        model: model,
         choices: [.init(index: 0, message: responseMessage, finish_reason: finishReason, logprobs: nil)],
         usage: .init(prompt_tokens: usage.promptTokens, completion_tokens: usage.completionTokens,
                      total_tokens: usage.totalTokens)
@@ -687,6 +694,7 @@ private func streamingResponse(
     prompt: Prompt,
     id: String,
     created: Int,
+    model: String,
     genOpts: GenerationOptions,
     promptTokens: PromptTokens,
     includeUsage: Bool,
@@ -722,7 +730,7 @@ private func streamingResponse(
             }
 
             // Role announcement chunk
-            let roleLine = sseDataLine(sseRoleChunk(id: id, created: created, includeUsage: includeUsage))
+            let roleLine = sseDataLine(sseRoleChunk(id: id, created: created, model: model, includeUsage: includeUsage))
             responseLines?.append(roleLine.trimmingCharacters(in: .whitespacesAndNewlines))
             continuation.yield(ByteBuffer(string: roleLine))
             await eventBox.append("sent role chunk")
@@ -801,7 +809,7 @@ private func streamingResponse(
                     let scalars = content.unicodeScalars
                     let idx = scalars.index(scalars.startIndex, offsetBy: emittedContentCount)
                     let delta = String(content[idx...])
-                    let chunkLine = sseDataLine(sseContentChunk(id: id, created: created, content: delta, includeUsage: includeUsage))
+                    let chunkLine = sseDataLine(sseContentChunk(id: id, created: created, model: model, content: delta, includeUsage: includeUsage))
                     responseLines?.append(chunkLine.trimmingCharacters(in: .whitespacesAndNewlines))
                     continuation.yield(ByteBuffer(string: chunkLine))
                     emittedContentCount = content.unicodeScalars.count
@@ -866,7 +874,7 @@ private func streamingResponse(
                         ? JSONFenceStripper.strip(prev)
                         : String(prev[prevScalars.index(prevScalars.startIndex, offsetBy: emittedContentCount)...])
                     if !deliveredContent.isEmpty {
-                        let contentLine = sseDataLine(sseContentChunk(id: id, created: created, content: deliveredContent, includeUsage: includeUsage))
+                        let contentLine = sseDataLine(sseContentChunk(id: id, created: created, model: model, content: deliveredContent, includeUsage: includeUsage))
                         responseLines?.append(contentLine.trimmingCharacters(in: .whitespacesAndNewlines))
                         continuation.yield(ByteBuffer(string: contentLine))
                         await eventBox.append("buffered content delta chars=\(deliveredContent.count)")
@@ -916,7 +924,7 @@ private func streamingResponse(
                     // chunk with finish_reason=null, then a SEPARATE empty-delta
                     // chunk carries finish_reason. Never bundle the two.
                     let toolChunk = ChatCompletionChunk(
-                        id: id, object: "chat.completion.chunk", created: created, model: modelName,
+                        id: id, object: "chat.completion.chunk", created: created, model: model,
                         choices: [.init(
                             index: 0,
                             delta: .init(role: nil, content: nil, tool_calls: chunkToolCalls),
@@ -931,7 +939,7 @@ private func streamingResponse(
                     continuation.yield(ByteBuffer(string: toolLine))
 
                     let toolFinishChunk = ChatCompletionChunk(
-                        id: id, object: "chat.completion.chunk", created: created, model: modelName,
+                        id: id, object: "chat.completion.chunk", created: created, model: model,
                         choices: [.init(index: 0, delta: .init(role: nil, content: nil, tool_calls: nil), finish_reason: finishReason, logprobs: nil)],
                         usage: nil,
                         includeUsageNull: includeUsage
@@ -942,7 +950,7 @@ private func streamingResponse(
                     await eventBox.append("tool_calls detected: \(calls.map(\.name).joined(separator: ", "))")
                 } else {
                     let stopChunk = ChatCompletionChunk(
-                        id: id, object: "chat.completion.chunk", created: created, model: modelName,
+                        id: id, object: "chat.completion.chunk", created: created, model: model,
                         choices: [.init(index: 0, delta: .init(role: nil, content: nil, tool_calls: nil), finish_reason: finishReason, logprobs: nil)],
                         usage: nil,
                         includeUsageNull: includeUsage
@@ -956,7 +964,7 @@ private func streamingResponse(
                 // opted in via stream_options.include_usage=true. Without
                 // opt-in, the empty-choices usage chunk is a spec violation.
                 if includeUsage {
-                    let usageChunk = sseUsageChunk(id: id, created: created, promptTokens: finalUsage.promptTokens, completionTokens: finalUsage.completionTokens)
+                    let usageChunk = sseUsageChunk(id: id, created: created, model: model, promptTokens: finalUsage.promptTokens, completionTokens: finalUsage.completionTokens)
                     let usageLine = sseDataLine(usageChunk)
                     responseLines?.append(usageLine.trimmingCharacters(in: .whitespacesAndNewlines))
                     continuation.yield(ByteBuffer(string: usageLine))
@@ -1003,7 +1011,7 @@ private func streamingResponse(
                     // emittedContentCount is in Unicode scalars (#543), so the
                     // held tail is cut in scalars too.
                     if (jsonMode || emittedContentCount < truncatedContent.unicodeScalars.count), !pending.isEmpty {
-                        let contentLine = sseDataLine(sseContentChunk(id: id, created: created, content: pending, includeUsage: includeUsage))
+                        let contentLine = sseDataLine(sseContentChunk(id: id, created: created, model: model, content: pending, includeUsage: includeUsage))
                         responseLines?.append(contentLine.trimmingCharacters(in: .whitespacesAndNewlines))
                         continuation.yield(ByteBuffer(string: contentLine))
                         await eventBox.append("buffered content delta before length chars=\(pending.count)")
@@ -1021,7 +1029,7 @@ private func streamingResponse(
                             completionTokens: completionTokens)
                     }
                     let lengthChunk = ChatCompletionChunk(
-                        id: id, object: "chat.completion.chunk", created: created, model: modelName,
+                        id: id, object: "chat.completion.chunk", created: created, model: model,
                         choices: [.init(
                             index: 0,
                             delta: .init(role: nil, content: nil, tool_calls: nil),
@@ -1037,7 +1045,7 @@ private func streamingResponse(
 
                     if includeUsage {
                         let usageChunk = sseUsageChunk(
-                            id: id, created: created,
+                            id: id, created: created, model: model,
                             promptTokens: truncatedUsage.promptTokens, completionTokens: truncatedUsage.completionTokens
                         )
                         let usageLine = sseDataLine(usageChunk)
@@ -1051,11 +1059,11 @@ private func streamingResponse(
                 } else if case .refusal(let explanation) = classified {
                     // OpenAI wire format: stream a refusal delta, then a final
                     // chunk with finish_reason=content_filter, then [DONE].
-                    let refusalLine = sseDataLine(sseRefusalChunk(id: id, created: created, refusal: explanation, includeUsage: includeUsage))
+                    let refusalLine = sseDataLine(sseRefusalChunk(id: id, created: created, model: model, refusal: explanation, includeUsage: includeUsage))
                     responseLines?.append(refusalLine.trimmingCharacters(in: .whitespacesAndNewlines))
                     continuation.yield(ByteBuffer(string: refusalLine))
 
-                    let finishLine = sseDataLine(sseContentFilterFinishChunk(id: id, created: created, includeUsage: includeUsage))
+                    let finishLine = sseDataLine(sseContentFilterFinishChunk(id: id, created: created, model: model, includeUsage: includeUsage))
                     responseLines?.append(finishLine.trimmingCharacters(in: .whitespacesAndNewlines))
                     continuation.yield(ByteBuffer(string: finishLine))
 
@@ -1078,7 +1086,7 @@ private func streamingResponse(
                     completionTokens = refusalUsage.completionTokens
                     if includeUsage {
                         let usageChunk = sseUsageChunk(
-                            id: id, created: created,
+                            id: id, created: created, model: model,
                             promptTokens: refusalUsage.promptTokens,
                             completionTokens: refusalUsage.completionTokens
                         )
@@ -1161,6 +1169,7 @@ private func structuredNonStreamingResponse(
     renderer: StructuredJSONRenderer,
     id: String,
     created: Int,
+    model: String,
     genOpts: GenerationOptions,
     promptTokens: PromptTokens,
     requestBody: String?,
@@ -1180,7 +1189,7 @@ private func structuredNonStreamingResponse(
         let classified = classifyModelError(error)
         if case .refusal(let explanation) = classified {
             return await refusalNonStreamingResponse(
-                id: id, created: created, promptTokens: await promptTokens.resolve(),
+                id: id, created: created, model: model, promptTokens: await promptTokens.resolve(),
                 refusal: explanation, requestBody: requestBody,
                 events: events + ["refusal: \(classified.cliLabel)"]
             )
@@ -1213,7 +1222,7 @@ private func structuredNonStreamingResponse(
         id: id,
         object: "chat.completion",
         created: created,
-        model: modelName,
+        model: model,
         choices: [.init(index: 0, message: responseMessage, finish_reason: finishReason, logprobs: nil)],
         usage: .init(prompt_tokens: usage.promptTokens, completion_tokens: usage.completionTokens,
                      total_tokens: usage.totalTokens)
@@ -1246,6 +1255,7 @@ private func structuredStreamingResponse(
     renderer: StructuredJSONRenderer,
     id: String,
     created: Int,
+    model: String,
     genOpts: GenerationOptions,
     promptTokens: PromptTokens,
     includeUsage: Bool,
@@ -1277,7 +1287,7 @@ private func structuredStreamingResponse(
                 }
             }
 
-            let roleLine = sseDataLine(sseRoleChunk(id: id, created: created, includeUsage: includeUsage))
+            let roleLine = sseDataLine(sseRoleChunk(id: id, created: created, model: model, includeUsage: includeUsage))
             responseLines?.append(roleLine.trimmingCharacters(in: .whitespacesAndNewlines))
             continuation.yield(ByteBuffer(string: roleLine))
             await eventBox.append("sent role chunk")
@@ -1294,7 +1304,7 @@ private func structuredStreamingResponse(
                 var lastContent: GeneratedContent?
                 func emitDelta(_ delta: String) async {
                     let chunkLine = sseDataLine(sseContentChunk(
-                        id: id, created: created, content: delta, includeUsage: includeUsage))
+                        id: id, created: created, model: model, content: delta, includeUsage: includeUsage))
                     responseLines?.append(chunkLine.trimmingCharacters(in: .whitespacesAndNewlines))
                     continuation.yield(ByteBuffer(string: chunkLine))
                 }
@@ -1330,7 +1340,7 @@ private func structuredStreamingResponse(
                 }
                 let finishReason = FinishReason.stop.openAIValue
                 let stopChunk = ChatCompletionChunk(
-                    id: id, object: "chat.completion.chunk", created: created, model: modelName,
+                    id: id, object: "chat.completion.chunk", created: created, model: model,
                     choices: [.init(index: 0, delta: .init(role: nil, content: nil, tool_calls: nil), finish_reason: finishReason, logprobs: nil)],
                     usage: nil,
                     includeUsageNull: includeUsage
@@ -1340,7 +1350,7 @@ private func structuredStreamingResponse(
                 continuation.yield(ByteBuffer(string: stopLine))
 
                 if includeUsage {
-                    let usageChunk = sseUsageChunk(id: id, created: created, promptTokens: finalUsage.promptTokens, completionTokens: finalUsage.completionTokens)
+                    let usageChunk = sseUsageChunk(id: id, created: created, model: model, promptTokens: finalUsage.promptTokens, completionTokens: finalUsage.completionTokens)
                     let usageLine = sseDataLine(usageChunk)
                     responseLines?.append(usageLine.trimmingCharacters(in: .whitespacesAndNewlines))
                     continuation.yield(ByteBuffer(string: usageLine))
@@ -1355,18 +1365,18 @@ private func structuredStreamingResponse(
             } catch {
                 let classified = classifyModelError(error)
                 if case .refusal(let explanation) = classified {
-                    let refusalLine = sseDataLine(sseRefusalChunk(id: id, created: created, refusal: explanation, includeUsage: includeUsage))
+                    let refusalLine = sseDataLine(sseRefusalChunk(id: id, created: created, model: model, refusal: explanation, includeUsage: includeUsage))
                     responseLines?.append(refusalLine.trimmingCharacters(in: .whitespacesAndNewlines))
                     continuation.yield(ByteBuffer(string: refusalLine))
 
-                    let finishLine = sseDataLine(sseContentFilterFinishChunk(id: id, created: created, includeUsage: includeUsage))
+                    let finishLine = sseDataLine(sseContentFilterFinishChunk(id: id, created: created, model: model, includeUsage: includeUsage))
                     responseLines?.append(finishLine.trimmingCharacters(in: .whitespacesAndNewlines))
                     continuation.yield(ByteBuffer(string: finishLine))
 
                     completionTokens = await TokenCounter.shared.count(
                         StreamErrorResolver.refusalCompletionText(prev: prev, explanation: explanation))
                     if includeUsage {
-                        let usageChunk = sseUsageChunk(id: id, created: created, promptTokens: await promptTokens.resolve(), completionTokens: completionTokens)
+                        let usageChunk = sseUsageChunk(id: id, created: created, model: model, promptTokens: await promptTokens.resolve(), completionTokens: completionTokens)
                         let usageLine = sseDataLine(usageChunk)
                         responseLines?.append(usageLine.trimmingCharacters(in: .whitespacesAndNewlines))
                         continuation.yield(ByteBuffer(string: usageLine))
@@ -1489,6 +1499,7 @@ func toolPolicyFailure(
 private func refusalNonStreamingResponse(
     id: String,
     created: Int,
+    model: String,
     promptTokens refusedPromptTokens: Int,
     completedRounds: [TokenUsage] = [],
     refusal: String,
@@ -1509,7 +1520,7 @@ private func refusalNonStreamingResponse(
         id: id,
         object: "chat.completion",
         created: created,
-        model: modelName,
+        model: model,
         choices: [.init(index: 0, message: responseMessage, finish_reason: finishReason, logprobs: nil)],
         usage: .init(
             prompt_tokens: promptTokens,
@@ -1539,6 +1550,7 @@ private func refusalNonStreamingResponse(
 private func refusalStreamingResponse(
     id: String,
     created: Int,
+    model: String,
     promptTokens refusedPromptTokens: Int,
     completedRounds: [TokenUsage] = [],
     refusal: String,
@@ -1554,13 +1566,13 @@ private func refusalStreamingResponse(
     let completionTokens = usage.completionTokens
     let finishReason = FinishReason.contentFilter.openAIValue
     var chunks: [String] = [
-        sseDataLine(sseRoleChunk(id: id, created: created, includeUsage: includeUsage)),
-        sseDataLine(sseRefusalChunk(id: id, created: created, refusal: refusal, includeUsage: includeUsage)),
-        sseDataLine(sseContentFilterFinishChunk(id: id, created: created, includeUsage: includeUsage)),
+        sseDataLine(sseRoleChunk(id: id, created: created, model: model, includeUsage: includeUsage)),
+        sseDataLine(sseRefusalChunk(id: id, created: created, model: model, refusal: refusal, includeUsage: includeUsage)),
+        sseDataLine(sseContentFilterFinishChunk(id: id, created: created, model: model, includeUsage: includeUsage)),
     ]
     if includeUsage {
         chunks.append(sseDataLine(sseUsageChunk(
-            id: id, created: created,
+            id: id, created: created, model: model,
             promptTokens: promptTokens, completionTokens: completionTokens
         )))
     }
